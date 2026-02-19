@@ -520,7 +520,6 @@ def main() -> None:
                 max_value=50000000.0,
                 value=100000.0,
                 step=1000.0,
-                format="%,.0f",
             )
             max_stocks_per_day = st.number_input(
                 "Max Stocks/Day (0 = unlimited)",
