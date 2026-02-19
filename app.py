@@ -402,95 +402,177 @@ def _run_backtest_pipeline(
     st.session_state["failed_symbols_count"] = len(failed_symbols)
 
 
+def _get_cached_symbol_count() -> int | None:
+    """Get cached symbol count - wrapped for caching."""
+    cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
+    if not cache_db_path.exists():
+        return 0
+    try:
+        from market_data_store import MarketDataStore
+        store = MarketDataStore(cache_db_path)
+        with store._connect() as conn:
+            count = conn.execute("SELECT COUNT(DISTINCT instrument_key) FROM candles_5m").fetchone()[0]
+            return count
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def _get_cached_count_cached():
+    """Cache the symbol count for 60 seconds to avoid repeated DB hits."""
+    return _get_cached_symbol_count()
+
+
 def main() -> None:
-    st.set_page_config(page_title="Chartink Backtester", layout="wide")
+    st.set_page_config(
+        page_title="Chartink Backtester",
+        layout="wide",
+        initial_sidebar_state="expanded",
+        menu_items={
+            "Get Help": None,
+            "Report a bug": None,
+            "About": "📈 Chartink Backtester - Backtest your trading strategies with historical data",
+        },
+    )
     _ensure_state()
 
-    st.title("Chartink Backtester (Upstox 5m)")
-    st.caption(
-        "Rules: entry on trigger day at configured IST time, optional per-day max stock cap, "
-        "exit by TP/SL or holding period end."
-    )
+    # Modern header with emoji and styling
+    st.markdown("""
+        <h1 style='margin-bottom: 0;'>📈 Chartink Backtester</h1>
+        <p style='color: #666; margin-top: 0.5rem;'>Backtest intraday strategies using Upstox 5-minute candle data</p>
+        <hr style='margin: 1rem 0; border: 0; border-top: 1px solid #eee;'>
+    """, unsafe_allow_html=True)
+
+    # File upload section - PRIORITIZED (appears first for fast render)
+    with st.container():
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown("### 📤 Upload Strategy Signals")
+            uploaded_trigger_csv = st.file_uploader(
+                "Upload Chartink CSV export",
+                type=["csv"],
+                help="CSV with 'date' (dd-mm-yyyy) and 'symbol' columns",
+                label_visibility="collapsed",
+            )
+        with col2:
+            st.markdown("### 🚀 Actions")
+            cta1, cta2 = st.columns(2)
+            with cta1:
+                sync_data = st.button("✅ Validate", use_container_width=True, type="secondary")
+            with cta2:
+                run = st.button("▶️ Run Backtest", use_container_width=True, type="primary")
+
+    st.markdown("---")
 
     with st.sidebar:
-        st.header("Backtest Inputs")
+        st.markdown("## ⚙️ Strategy Settings")
         
-        stop_loss_pct = st.number_input("Stop Loss %", min_value=0.1, max_value=50.0, value=3.0, step=0.1)
-        take_profit_pct = st.number_input("Take Profit %", min_value=0.1, max_value=100.0, value=5.0, step=0.1)
+        with st.expander("📊 Risk Parameters", expanded=True):
+            stop_loss_pct = st.number_input(
+                "Stop Loss %",
+                min_value=0.1,
+                max_value=50.0,
+                value=3.0,
+                step=0.1,
+                format="%.1f",
+            )
+            take_profit_pct = st.number_input(
+                "Take Profit %",
+                min_value=0.1,
+                max_value=100.0,
+                value=5.0,
+                step=0.1,
+                format="%.1f",
+            )
         
-        trade_direction = st.selectbox(
-            "Trade Direction",
-            options=["BUY", "SELL"],
-            index=0,
-            help="SELL = Short selling. For SELL trades, holding period is always 1 day."
-        )
-        
-        # For SELL trades, force holding_days to 1
-        if trade_direction == "SELL":
-            holding_days = 1
-            st.caption("ℹ️ Holding days fixed at 1 for SELL trades")
-        else:
-            holding_days = st.number_input("Holding Days (Trading)", min_value=1, max_value=30, value=5, step=1)
-        
-        entry_time = st.time_input("Entry Time (IST)", value=time(9, 30), step=300)
+        with st.expander("📅 Trade Setup", expanded=True):
+            trade_direction = st.segmented_control(
+                "Direction",
+                options=["BUY", "SELL"],
+                default="BUY",
+                help="SELL = Short selling (intraday only)",
+            ) or "BUY"
+            
+            # For SELL trades, force holding_days to 1
+            if trade_direction == "SELL":
+                holding_days = 1
+                st.info("⏱️ **Intraday Only**: SELL trades auto-exit by EOD", icon="ℹ️")
+            else:
+                holding_days = st.number_input(
+                    "Holding Days",
+                    min_value=1,
+                    max_value=30,
+                    value=5,
+                    step=1,
+                    help="Trading days (not calendar days)",
+                )
+            
+            entry_time = st.time_input(
+                "Entry Time (IST)",
+                value=time(9, 30),
+                step=300,
+            )
 
-        capital_per_trade = st.number_input(
-            "Capital per Trade (INR)",
-            min_value=1000.0,
-            max_value=50000000.0,
-            value=100000.0,
-            step=1000.0,
-        )
-        max_stocks_per_day = st.number_input(
-            "Max Stocks per Day (0 = no cap)",
-            min_value=0,
-            max_value=1000,
-            value=0,
-            step=1,
-        )
-        brokerage_per_side = st.number_input(
-            "Brokerage per Side (INR)", min_value=0.0, max_value=5000.0, value=20.0, step=1.0
-        )
+        with st.expander("💰 Capital & Fees", expanded=False):
+            capital_per_trade = st.number_input(
+                "Capital per Trade (₹)",
+                min_value=1000.0,
+                max_value=50000000.0,
+                value=100000.0,
+                step=1000.0,
+                format="%,.0f",
+            )
+            max_stocks_per_day = st.number_input(
+                "Max Stocks/Day (0 = unlimited)",
+                min_value=0,
+                max_value=1000,
+                value=0,
+                step=1,
+            )
+            brokerage_per_side = st.number_input(
+                "Brokerage per Side (₹)",
+                min_value=0.0,
+                max_value=5000.0,
+                value=20.0,
+                step=1.0,
+            )
 
-        tie_break_rule = st.selectbox(
-            "If TP and SL hit in same 5m candle",
-            options=["conservative", "optimistic"],
-            index=0,
-            help="conservative = SL first, optimistic = TP first",
-        )
+        with st.expander("🔧 Advanced", expanded=False):
+            tie_break_rule = st.selectbox(
+                "Same-candle TP/SL rule",
+                options=["conservative", "optimistic"],
+                index=0,
+                help="Which exit to take when both hit in same 5m candle",
+            )
+            st.caption("Conservative = SL first | Optimistic = TP first")
 
         st.divider()
-        st.subheader("Cache Management")
+        st.markdown("### 💾 Cache")
         
-        # Show cache stats
-        cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
-        if cache_db_path.exists():
-            try:
-                from market_data_store import MarketDataStore
-                store = MarketDataStore(cache_db_path)
-                with store._connect() as conn:
-                    count = conn.execute("SELECT COUNT(DISTINCT instrument_key) FROM candles_5m").fetchone()[0]
-                    st.caption(f"Cached symbols: {count}")
-            except Exception:
-                st.caption("Cache status: unknown")
+        # Deferred cache stats lookup
+        cached_count = _get_cached_count_cached()
+        if cached_count == 0:
+            st.caption("📭 No cached data")
+        elif cached_count is None:
+            st.caption("⚠️ Cache status unknown")
         else:
-            st.caption("No cached data")
+            st.caption(f"📦 {cached_count} symbols cached")
         
-        if st.button("Clear Cache", type="secondary"):
+        if st.button("🗑️ Clear Cache", use_container_width=True):
             try:
+                cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
                 if cache_db_path.exists():
                     cache_db_path.unlink()
-                    st.success("Cache cleared!")
+                    st.success("✅ Cache cleared!")
+                    st.rerun()
                 else:
-                    st.info("No cache to clear")
+                    st.info("ℹ️ No cache to clear")
             except Exception as e:
-                st.error(f"Failed to clear cache: {e}")
+                st.error(f"❌ Failed to clear cache: {e}")
 
-    uploaded_trigger_csv = st.file_uploader("Upload Chartink Trigger CSV", type=["csv"])
-
-    cta1, cta2 = st.columns(2)
-    sync_data = cta1.button("Validate Symbols")
-    run = cta2.button("Run Backtest", type="primary")
+    # ───────────────────────────────────────────────────────────────────────────────
+    # HANDLE BUTTON ACTIONS
+    # ───────────────────────────────────────────────────────────────────────────────
 
     if sync_data:
         if uploaded_trigger_csv is None:
@@ -545,11 +627,30 @@ def main() -> None:
             return
 
     if not st.session_state["result_ready"]:
-        st.info("1. Upload trigger CSV  2. (Optional) Click Validate Symbols  3. Run Backtest")
+        # Welcome/getting started card
+        with st.container():
+            st.markdown("""
+                <div style="
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    padding: 2rem;
+                    border-radius: 1rem;
+                    color: white;
+                    margin: 1rem 0;
+                ">
+                    <h3 style="margin-top: 0; color: white;">👋 Getting Started</h3>
+                    <ol style="margin-bottom: 0;">
+                        <li><b>Upload</b> your Chartink CSV export</li>
+                        <li><b>(Optional)</b> Click Validate to check symbols</li>
+                        <li><b>Run Backtest</b> to see results</li>
+                    </ol>
+                </div>
+            """, unsafe_allow_html=True)
+        
         unresolved_symbols = st.session_state.get("unresolved_symbols", [])
         if unresolved_symbols:
-            st.warning(f"{len(unresolved_symbols)} symbols not found in Upstox NSE instruments.")
-            st.dataframe(pd.DataFrame({"unresolved_symbol": unresolved_symbols}), width="stretch")
+            st.warning(f"⚠️ {len(unresolved_symbols)} symbols not found in Upstox.")
+            with st.expander("View unresolved symbols"):
+                st.dataframe(pd.DataFrame({"symbol": unresolved_symbols}), use_container_width=True, hide_index=True)
         return
 
     trades_df = st.session_state["trades_df"]
@@ -560,31 +661,42 @@ def main() -> None:
     non_trading_count = st.session_state["non_trading_count"]
     live_fetched_symbols_count = int(st.session_state.get("live_fetched_symbols_count", 0))
 
+    # Status alerts with modern styling
     if non_trading_count:
         st.warning(
-            f"{non_trading_count} triggers are on weekends/holidays and were skipped "
-            f"(strict same-day configured entry-time rule)."
+            f"⚠️ **{non_trading_count}** triggers on weekends/holidays were skipped "
+            f"(strict same-day entry rule).",
+            icon="📅",
         )
 
     if unresolved_symbols:
-        st.warning(f"{len(unresolved_symbols)} symbols not found in Upstox NSE instruments. They were skipped.")
-        st.dataframe(pd.DataFrame({"unresolved_symbol": unresolved_symbols}), width="stretch")
+        with st.expander(f"❌ {len(unresolved_symbols)} symbols not found in Upstox", expanded=False):
+            st.dataframe(pd.DataFrame({"symbol": unresolved_symbols}), use_container_width=True, hide_index=True)
     
-    # Show data source breakdown
+    # Data source pills
     cached_symbols_count = int(st.session_state.get("cached_symbols_count", 0))
     failed_symbols_count = int(st.session_state.get("failed_symbols_count", 0))
     if cached_symbols_count > 0 or live_fetched_symbols_count > 0 or failed_symbols_count > 0:
-        source_parts = []
+        source_pills = []
         if live_fetched_symbols_count > 0:
-            source_parts.append(f"{live_fetched_symbols_count} fetched from Upstox API")
+            source_pills.append(f"🌐 {live_fetched_symbols_count} API")
         if cached_symbols_count > 0:
-            source_parts.append(f"{cached_symbols_count} from cache")
+            source_pills.append(f"💾 {cached_symbols_count} cached")
         if failed_symbols_count > 0:
-            source_parts.append(f"{failed_symbols_count} failed to load")
-        st.info(f"Data sources: {' | '.join(source_parts)}")
+            source_pills.append(f"❌ {failed_symbols_count} failed")
+        st.caption(" · ".join(source_pills))
 
-    st.subheader("PnL Analysis")
-    timeline = st.selectbox("Timeline", options=["2 months", "3 months", "6 months", "All time"], index=0)
+    # Results header with timeline selector
+    header_col1, header_col2 = st.columns([3, 1])
+    with header_col1:
+        st.markdown("## 📊 Results")
+    with header_col2:
+        timeline = st.selectbox(
+            "⏱️ Filter",
+            options=["2 months", "3 months", "6 months", "All time"],
+            index=0,
+            label_visibility="collapsed",
+        )
     filtered_trades, tested_range_label = _filter_trades_by_timeline(trades_df, timeline)
     filtered_summary = _compute_filtered_summary(filtered_trades)
     extended = _compute_extended_stats(filtered_trades)
@@ -600,61 +712,65 @@ def main() -> None:
     total_skipped = int(len(skipped_df))
     validated_symbols_count = int(st.session_state.get("validated_symbols_count", 0))
 
-    st.caption(tested_range_label)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Starting Capital Needed", f"₹{capital_metrics.get('required_starting_capital', 0.0):,.2f}")
-    c2.metric("Total Capital After Net", f"₹{capital_metrics.get('ending_capital_after_net', 0.0):,.2f}")
-    c3.metric("Total Return (Gross)", f"₹{filtered_summary.get('total_gross_pnl', 0.0):,.2f}")
-    c4.metric("Net Returns", f"₹{filtered_summary.get('total_net_pnl', 0.0):,.2f}")
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Brokerage", f"₹{filtered_summary.get('total_brokerage', 0.0):,.2f}")
-    c6.metric("Net Return %", f"{capital_metrics.get('net_return_pct_on_starting_capital', 0.0):.4f}%")
-    c7.metric("Win %", f"{filtered_summary.get('win_rate_pct', 0.0):.2f}%")
-    c8.metric("Loss %", f"{extended.get('loss_rate_pct', 0.0):.2f}%")
-
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("Profit Factor", f"{extended.get('profit_factor', 0.0):.3f}")
-    c10.metric("Risk/Reward Ratio", f"{extended.get('risk_reward_ratio', 0.0):.3f}")
-    c11.metric("Total Trades", filtered_summary.get("trades", 0))
-    c12.metric("Expectancy/Trade", f"₹{extended.get('expectancy_per_trade', 0.0):,.2f}")
-
-    c13, c14, c15, c16 = st.columns(4)
-    c13.metric("Average Profit", f"₹{extended.get('avg_win', 0.0):,.2f}")
-    c14.metric("Average Loss", f"₹{extended.get('avg_loss', 0.0):,.2f}")
-    c15.metric("Max Profit/Trade", f"₹{extended.get('best_trade', 0.0):,.2f}")
-    if c15.button("View Max Profit Trade", key="btn_view_max_profit"):
-        idx = metric_trades.get("max_profit_idx")
-        if idx is not None and 0 <= idx < len(filtered_trades):
-            st.session_state["selected_trade_idx"] = int(idx)
-            row = filtered_trades.iloc[int(idx)]
-            st.session_state["selected_trade_note"] = (
-                f"Max Profit Trade: {row['symbol']} on {pd.to_datetime(row['trigger_date']).date()} "
-                f"(Net ₹{float(row['net_pnl']):,.2f})"
+    st.caption(f"📅 {tested_range_label}")
+    
+    # Key metrics in styled containers
+    with st.container():
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(
+                "💰 Starting Capital",
+                f"₹{capital_metrics.get('required_starting_capital', 0.0):,.0f}",
             )
-    c16.metric("Max Loss/Trade", f"₹{extended.get('worst_trade', 0.0):,.2f}")
-
-    c17, c18, c19, c20 = st.columns(4)
-    c17.metric("Max Drawdown", f"₹{extended.get('max_drawdown', 0.0):,.2f}")
-    if c17.button("View Max Drawdown Trigger Trade", key="btn_view_max_dd_trade"):
-        idx = metric_trades.get("max_drawdown_trade_idx")
-        if idx is not None and 0 <= idx < len(filtered_trades):
-            st.session_state["selected_trade_idx"] = int(idx)
-            row = filtered_trades.iloc[int(idx)]
-            st.session_state["selected_trade_note"] = (
-                f"Max Drawdown Trigger Trade: {row['symbol']} on {pd.to_datetime(row['trigger_date']).date()} "
-                f"(Net ₹{float(row['net_pnl']):,.2f})"
+        with col2:
+            net_pnl = filtered_summary.get('total_net_pnl', 0.0)
+            delta = capital_metrics.get('net_return_pct_on_starting_capital', 0.0)
+            st.metric(
+                "📈 Net P&L",
+                f"₹{net_pnl:,.2f}",
+                f"{delta:.2f}%",
+                delta_color="normal",
             )
-    c18.metric("Median Holding (hrs)", f"{extended.get('median_holding_hours', 0.0):.2f}")
-    c19.metric("Uploaded Triggers", total_triggers)
-    c20.metric("Skipped Rows", total_skipped)
+        with col3:
+            st.metric(
+                "🎯 Win Rate",
+                f"{filtered_summary.get('win_rate_pct', 0.0):.1f}%",
+                f"{filtered_summary.get('trades', 0)} trades",
+            )
+        with col4:
+            st.metric(
+                "⚖️ Profit Factor",
+                f"{extended.get('profit_factor', 0.0):.2f}",
+            )
 
-    c21, c22, c23 = st.columns(3)
-    c21.metric("Symbols From Cache", cached_symbols_count)
-    c22.metric("Symbols Fetched Live", live_fetched_symbols_count)
-    c23.metric("Symbols Validated", validated_symbols_count)
+    with st.expander("📋 Detailed Metrics", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Gross Returns", f"₹{filtered_summary.get('total_gross_pnl', 0.0):,.2f}")
+        c2.metric("Brokerage", f"₹{filtered_summary.get('total_brokerage', 0.0):,.2f}")
+        c3.metric("Ending Capital", f"₹{capital_metrics.get('ending_capital_after_net', 0.0):,.2f}")
+        c4.metric("Expectancy", f"₹{extended.get('expectancy_per_trade', 0.0):,.2f}")
 
-    tab_summary, tab_trades, tab_logs = st.tabs(["Summary", "Trade Explorer", "Diagnostics & Downloads"])
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Avg Win", f"₹{extended.get('avg_win', 0.0):,.2f}")
+        c6.metric("Avg Loss", f"₹{extended.get('avg_loss', 0.0):,.2f}")
+        c7.metric("Best Trade", f"₹{extended.get('best_trade', 0.0):,.2f}")
+        c8.metric("Worst Trade", f"₹{extended.get('worst_trade', 0.0):,.2f}")
+        
+        c9, c10, c11, c12 = st.columns(4)
+        c9.metric("Max Drawdown", f"₹{extended.get('max_drawdown', 0.0):,.2f}")
+        c10.metric("Risk/Reward", f"{extended.get('risk_reward_ratio', 0.0):.2f}")
+        c11.metric("Median Hold", f"{extended.get('median_holding_hours', 0.0):.1f}h")
+        c12.metric("Loss Rate", f"{extended.get('loss_rate_pct', 0.0):.1f}%")
+    
+    # Quick stats row
+    st.markdown("---")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.caption(f"📤 Triggers: **{total_triggers}**")
+    q2.caption(f"⏭️ Skipped: **{total_skipped}**")
+    q3.caption(f"💾 From Cache: **{cached_symbols_count}**")
+    q4.caption(f"🌐 Fetched Live: **{live_fetched_symbols_count}**")
+
+    tab_summary, tab_trades, tab_logs = st.tabs(["📈 Summary", "🔍 Trade Explorer", "📋 Diagnostics"])
 
     with tab_summary:
         if not filtered_trades.empty:
@@ -690,15 +806,19 @@ def main() -> None:
 
     with tab_trades:
         if filtered_trades.empty:
-            st.info("No trades available in selected timeline.")
+            st.info("📭 No trades available in selected timeline.")
         else:
             note = st.session_state.get("selected_trade_note", "")
             if note:
-                st.success(note)
+                st.success(f"✅ {note}")
+            
             display_cols = [c for c in filtered_trades.columns if c not in {"exit_timestamp_dt", "trigger_date_dt"}]
-            st.caption("Green rows: profit trades, Red rows: loss trades.")
-            st.dataframe(_style_trade_rows(filtered_trades[display_cols]), width="stretch", hide_index=True)
+            st.caption("🟢 Green = Profit | 🔴 Red = Loss")
+            st.dataframe(_style_trade_rows(filtered_trades[display_cols]), use_container_width=True, hide_index=True)
 
+            st.markdown("---")
+            st.markdown("### 📊 Trade Chart Explorer")
+            
             picker_df = filtered_trades.reset_index(drop=True)
             options = [
                 f"{i+1}. {r.symbol} | {pd.to_datetime(r.trigger_date).date()} | Net ₹{float(r.net_pnl):,.2f}"
@@ -707,7 +827,7 @@ def main() -> None:
             preselect_idx = int(st.session_state.get("selected_trade_idx", 0))
             if preselect_idx < 0 or preselect_idx >= len(options):
                 preselect_idx = 0
-            selected_label = st.selectbox("Select trade for OHLC", options=options, index=preselect_idx, key="trade_picker")
+            selected_label = st.selectbox("Select trade to visualize", options=options, index=preselect_idx, key="trade_picker")
             selected_idx = options.index(selected_label)
             st.session_state["selected_trade_idx"] = selected_idx
             selected_trade = picker_df.iloc[selected_idx]
@@ -715,7 +835,7 @@ def main() -> None:
             symbol_to_key: dict[str, str] = st.session_state.get("symbol_to_key", {})
             key = symbol_to_key.get(str(selected_trade["symbol"]))
             if not key:
-                st.warning("Unable to fetch chart candles for selected trade (missing symbol mapping).")
+                st.warning("⚠️ Unable to fetch chart (missing symbol mapping).")
             else:
                 chart_from = pd.to_datetime(selected_trade["trigger_date"]).date()
                 chart_to = pd.to_datetime(selected_trade["exit_timestamp"]).date()
@@ -789,21 +909,31 @@ def main() -> None:
                     st.plotly_chart(fig, width="stretch")
 
     with tab_logs:
-        st.caption("Caching mode: candles are fetched from SQLite cache if available; missing data is fetched from Upstox.")
+        st.info("💾 Data is cached in SQLite. Missing data is fetched from Upstox API.", icon="ℹ️")
 
-        st.subheader("Skipped Records")
-        st.dataframe(skipped_df, width="stretch")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### ⏭️ Skipped Records")
+            if skipped_df.empty:
+                st.caption("No records skipped")
+            else:
+                st.dataframe(skipped_df, use_container_width=True, hide_index=True)
+        with col2:
+            st.markdown("### 💰 Capital Timeline")
+            if capital_timeline_df.empty:
+                st.caption("No timeline data")
+            else:
+                st.dataframe(capital_timeline_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Capital Timeline")
-        st.dataframe(capital_timeline_df, width="stretch")
-
+        st.markdown("---")
+        st.markdown("### 💾 Export Data")
         c1, c2, c3 = st.columns(3)
         with c1:
-            _download_button(trades_df, "Download Trades CSV", "trades.csv")
+            _download_button(trades_df, "📥 Trades CSV", "trades.csv")
         with c2:
-            _download_button(skipped_df, "Download Skipped CSV", "skipped.csv")
+            _download_button(skipped_df, "📥 Skipped CSV", "skipped.csv")
         with c3:
-            _download_button(capital_timeline_df, "Download Capital Timeline CSV", "capital_timeline.csv")
+            _download_button(capital_timeline_df, "📥 Capital CSV", "capital_timeline.csv")
 
 
 if __name__ == "__main__":
