@@ -261,6 +261,8 @@ def _ensure_state() -> None:
         "validated_symbols_count": 0,
         "sync_last_message": "",
         "live_fetched_symbols_count": 0,
+        "cached_symbols_count": 0,
+        "failed_symbols_count": 0,
         "selected_trade_idx": 0,
         "selected_trade_note": "",
     }
@@ -296,8 +298,8 @@ def _sync_data_for_csv(
         trigger_csv_bytes, access_token
     )
     st.session_state["sync_last_message"] = (
-        f"Validated {len(symbol_to_key)} symbols for live mode. "
-        "DB sync is disabled; candles will be fetched directly from Upstox during backtest."
+        f"Validated {len(symbol_to_key)} symbols for backtesting. "
+        "Candles will be fetched from cache if available; missing data will be fetched from Upstox."
     )
     st.session_state["symbol_to_key"] = symbol_to_key
     st.session_state["unresolved_symbols"] = unresolved_symbols
@@ -311,12 +313,20 @@ def _run_backtest_pipeline(
     access_token: str,
     params: BacktestParams,
 ) -> None:
+    from market_data_store import MarketDataStore
+
     parsed_triggers, symbol_to_key, unresolved_symbols, non_trading_count = _resolve_symbols_for_csv(
         trigger_csv_bytes, access_token
     )
     holidays = load_holidays(DEFAULT_HOLIDAY_PATH)
     live_fetched_symbols: set[str] = set()
+    cached_symbols: set[str] = set()
+    failed_symbols: set[str] = set()
     symbol_data_cache: dict[str, pd.DataFrame] = {}
+    
+    # Initialize market data store for caching
+    cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
+    store = MarketDataStore(cache_db_path)
 
     with UpstoxDataClient(UpstoxConfig(access_token=access_token)) as client:
         selected_triggers = choose_daily_triggers(parsed_triggers, params.max_stocks_per_day)
@@ -339,15 +349,27 @@ def _run_backtest_pipeline(
 
                 from_date = row.min_date
                 to_date = row.max_date + timedelta(days=calendar_buffer_days)
+                
+                # Check if we have cached data first (for reporting)
+                if store.has_coverage(key, from_date, to_date):
+                    cached_symbols.add(symbol)
+                
                 try:
-                    data = client.fetch_5min_candles(key, from_date, to_date)
-                    live_fetched_symbols.add(symbol)
-                except Exception:
-                    data = pd.DataFrame()
-                if not data.empty:
-                    data = data.copy()
-                    data["_date"] = pd.to_datetime(data["timestamp"], errors="coerce").dt.date
-                symbol_data_cache[symbol] = data
+                    # Use cached fetcher - returns cached data if available, otherwise fetches and stores
+                    data = client.fetch_5min_candles_cached(key, symbol, from_date, to_date, store)
+                    if not data.empty:
+                        live_fetched_symbols.add(symbol)
+                        data = data.copy()
+                        data["_date"] = pd.to_datetime(data["timestamp"], errors="coerce").dt.date
+                    else:
+                        failed_symbols.add(symbol)
+                except UpstoxDataError as e:
+                    failed_symbols.add(symbol)
+                    st.warning(f"Failed to fetch data for {symbol}: {e}")
+                except Exception as e:
+                    failed_symbols.add(symbol)
+                    st.warning(f"Unexpected error fetching {symbol}: {e}")
+                symbol_data_cache[symbol] = data if not data.empty else pd.DataFrame()
                 progress.progress(
                     int(i * 100 / max(total_symbols, 1)),
                     text=f"Prepared candles for {i}/{total_symbols} symbols",
@@ -377,7 +399,10 @@ def _run_backtest_pipeline(
     st.session_state["symbol_to_key"] = symbol_to_key
     st.session_state["access_token"] = access_token
     st.session_state["parsed_triggers"] = parsed_triggers
-    st.session_state["live_fetched_symbols_count"] = len(live_fetched_symbols)
+    # Track data source stats
+    st.session_state["live_fetched_symbols_count"] = len(live_fetched_symbols - cached_symbols)
+    st.session_state["cached_symbols_count"] = len(cached_symbols)
+    st.session_state["failed_symbols_count"] = len(failed_symbols)
 
 
 def main() -> None:
@@ -393,10 +418,40 @@ def main() -> None:
     with st.sidebar:
         st.header("Backtest Inputs")
         access_token = st.text_input("Upstox Access Token", type="password")
+        
+        if st.button("Test Token", type="secondary"):
+            token = access_token.strip()
+            if not token:
+                st.error("Please enter an access token first")
+            else:
+                with st.spinner("Validating token..."):
+                    try:
+                        with UpstoxDataClient(UpstoxConfig(access_token=token)) as client:
+                            is_valid, message = client.validate_token()
+                            if is_valid:
+                                st.success(f"✓ {message}")
+                            else:
+                                st.error(f"✗ {message}")
+                    except Exception as e:
+                        st.error(f"✗ Validation failed: {e}")
 
         stop_loss_pct = st.number_input("Stop Loss %", min_value=0.1, max_value=50.0, value=3.0, step=0.1)
         take_profit_pct = st.number_input("Take Profit %", min_value=0.1, max_value=100.0, value=5.0, step=0.1)
-        holding_days = st.number_input("Holding Days (Trading)", min_value=1, max_value=30, value=5, step=1)
+        
+        trade_direction = st.selectbox(
+            "Trade Direction",
+            options=["BUY", "SELL"],
+            index=0,
+            help="SELL = Short selling. For SELL trades, holding period is always 1 day."
+        )
+        
+        # For SELL trades, force holding_days to 1
+        if trade_direction == "SELL":
+            holding_days = 1
+            st.caption("ℹ️ Holding days fixed at 1 for SELL trades")
+        else:
+            holding_days = st.number_input("Holding Days (Trading)", min_value=1, max_value=30, value=5, step=1)
+        
         entry_time = st.time_input("Entry Time (IST)", value=time(9, 30), step=300)
 
         capital_per_trade = st.number_input(
@@ -423,6 +478,33 @@ def main() -> None:
             index=0,
             help="conservative = SL first, optimistic = TP first",
         )
+
+        st.divider()
+        st.subheader("Cache Management")
+        
+        # Show cache stats
+        cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
+        if cache_db_path.exists():
+            try:
+                from market_data_store import MarketDataStore
+                store = MarketDataStore(cache_db_path)
+                with store._connect() as conn:
+                    count = conn.execute("SELECT COUNT(DISTINCT instrument_key) FROM candles_5m").fetchone()[0]
+                    st.caption(f"Cached symbols: {count}")
+            except Exception:
+                st.caption("Cache status: unknown")
+        else:
+            st.caption("No cached data")
+        
+        if st.button("Clear Cache", type="secondary"):
+            try:
+                if cache_db_path.exists():
+                    cache_db_path.unlink()
+                    st.success("Cache cleared!")
+                else:
+                    st.info("No cache to clear")
+            except Exception as e:
+                st.error(f"Failed to clear cache: {e}")
 
     uploaded_trigger_csv = st.file_uploader("Upload Chartink Trigger CSV", type=["csv"])
 
@@ -472,6 +554,7 @@ def main() -> None:
             entry_time=entry_time,
             brokerage_per_side=float(brokerage_per_side),
             tie_break_rule=str(tie_break_rule),
+            trade_direction=str(trade_direction),
         )
 
         try:
@@ -515,8 +598,19 @@ def main() -> None:
     if unresolved_symbols:
         st.warning(f"{len(unresolved_symbols)} symbols not found in Upstox NSE instruments. They were skipped.")
         st.dataframe(pd.DataFrame({"unresolved_symbol": unresolved_symbols}), width="stretch")
-    if live_fetched_symbols_count > 0:
-        st.info(f"{live_fetched_symbols_count} symbols were fetched live from Upstox for this backtest run.")
+    
+    # Show data source breakdown
+    cached_symbols_count = int(st.session_state.get("cached_symbols_count", 0))
+    failed_symbols_count = int(st.session_state.get("failed_symbols_count", 0))
+    if cached_symbols_count > 0 or live_fetched_symbols_count > 0 or failed_symbols_count > 0:
+        source_parts = []
+        if live_fetched_symbols_count > 0:
+            source_parts.append(f"{live_fetched_symbols_count} fetched from Upstox API")
+        if cached_symbols_count > 0:
+            source_parts.append(f"{cached_symbols_count} from cache")
+        if failed_symbols_count > 0:
+            source_parts.append(f"{failed_symbols_count} failed to load")
+        st.info(f"Data sources: {' | '.join(source_parts)}")
 
     st.subheader("PnL Analysis")
     timeline = st.selectbox("Timeline", options=["2 months", "3 months", "6 months", "All time"], index=0)
@@ -584,9 +678,10 @@ def main() -> None:
     c19.metric("Uploaded Triggers", total_triggers)
     c20.metric("Skipped Rows", total_skipped)
 
-    c21, c22 = st.columns(2)
-    c21.metric("Symbols Fetched Live", live_fetched_symbols_count)
-    c22.metric("Symbols Validated", validated_symbols_count)
+    c21, c22, c23 = st.columns(3)
+    c21.metric("Symbols From Cache", cached_symbols_count)
+    c22.metric("Symbols Fetched Live", live_fetched_symbols_count)
+    c23.metric("Symbols Validated", validated_symbols_count)
 
     tab_summary, tab_trades, tab_logs = st.tabs(["Summary", "Trade Explorer", "Diagnostics & Downloads"])
 
@@ -653,10 +748,16 @@ def main() -> None:
             else:
                 chart_from = pd.to_datetime(selected_trade["trigger_date"]).date()
                 chart_to = pd.to_datetime(selected_trade["exit_timestamp"]).date()
+                # Use cached fetcher for chart data
+                cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
+                from market_data_store import MarketDataStore
+                chart_store = MarketDataStore(cache_db_path)
                 with UpstoxDataClient(
                     UpstoxConfig(access_token=st.session_state.get("access_token", "") or access_token.strip())
                 ) as client:
-                    candles = client.fetch_5min_candles(key, chart_from, chart_to)
+                    candles = client.fetch_5min_candles_cached(
+                        key, str(selected_trade["symbol"]), chart_from, chart_to, chart_store
+                    )
 
                 candles = _normalize_plot_candles(candles)
                 if candles.empty:
@@ -718,7 +819,7 @@ def main() -> None:
                     st.plotly_chart(fig, width="stretch")
 
     with tab_logs:
-        st.caption("Live mode: candles are fetched directly from Upstox (SQLite is not used).")
+        st.caption("Caching mode: candles are fetched from SQLite cache if available; missing data is fetched from Upstox.")
 
         st.subheader("Skipped Records")
         st.dataframe(skipped_df, width="stretch")

@@ -22,10 +22,26 @@ class BacktestParams:
     entry_time: time = DEFAULT_ENTRY_TIME
     brokerage_per_side: float = 20.0
     tie_break_rule: str = "conservative"  # conservative => SL first, optimistic => TP first
+    trade_direction: str = "BUY"  # BUY or SELL
 
     @property
     def round_trip_brokerage(self) -> float:
         return self.brokerage_per_side * 2
+
+    @property
+    def is_buy(self) -> bool:
+        return self.trade_direction.upper() == "BUY"
+
+    @property
+    def is_sell(self) -> bool:
+        return self.trade_direction.upper() == "SELL"
+
+    @property
+    def effective_holding_days(self) -> int:
+        """For SELL trades, holding period is always 1 day."""
+        if self.is_sell:
+            return 1
+        return self.holding_days
 
 
 @dataclass(frozen=True)
@@ -149,7 +165,7 @@ def run_backtest(
             continue
 
         entry_ts = _entry_timestamp(trigger_day, params.entry_time)
-        exit_day_limit = get_nth_trading_day(trigger_day, params.holding_days, holidays)
+        exit_day_limit = get_nth_trading_day(trigger_day, params.effective_holding_days, holidays)
 
         candles = candle_fetcher(symbol, trigger_day, exit_day_limit)
         if candles.empty:
@@ -206,8 +222,13 @@ def run_backtest(
             )
             continue
 
-        tp_price = entry_price * (1 + params.take_profit_pct / 100)
-        sl_price = entry_price * (1 - params.stop_loss_pct / 100)
+        # For SELL trades, TP is below entry, SL is above entry
+        if params.is_buy:
+            tp_price = entry_price * (1 + params.take_profit_pct / 100)
+            sl_price = entry_price * (1 - params.stop_loss_pct / 100)
+        else:
+            tp_price = entry_price * (1 - params.take_profit_pct / 100)
+            sl_price = entry_price * (1 + params.stop_loss_pct / 100)
 
         monitored = candles[candles["timestamp"] >= entry_ts]
 
@@ -216,8 +237,14 @@ def run_backtest(
         exit_reason: str | None = None
 
         for c in monitored.itertuples(index=False):
-            hit_tp = float(c.high) >= tp_price
-            hit_sl = float(c.low) <= sl_price
+            # For BUY: TP when high >= target, SL when low <= stop
+            # For SELL: TP when low <= target, SL when high >= stop
+            if params.is_buy:
+                hit_tp = float(c.high) >= tp_price
+                hit_sl = float(c.low) <= sl_price
+            else:
+                hit_tp = float(c.low) <= tp_price
+                hit_sl = float(c.high) >= sl_price
 
             if hit_tp and hit_sl:
                 if params.tie_break_rule == "optimistic":
@@ -257,7 +284,12 @@ def run_backtest(
             exit_price = float(last["close"])
             exit_reason = "TIME_EXIT"
 
-        gross_pnl = (exit_price - entry_price) * quantity
+        # For BUY: profit when exit > entry
+        # For SELL: profit when exit < entry (shorting)
+        if params.is_buy:
+            gross_pnl = (exit_price - entry_price) * quantity
+        else:
+            gross_pnl = (entry_price - exit_price) * quantity
         brokerage = params.round_trip_brokerage
         net_pnl = gross_pnl - brokerage
 
@@ -270,6 +302,7 @@ def run_backtest(
                 "exit_timestamp": exit_ts,
                 "exit_price": round(float(exit_price), 6),
                 "quantity": quantity,
+                "trade_direction": params.trade_direction,
                 "capital_allocated": params.capital_per_trade,
                 "capital_deployed": round(quantity * entry_price, 2),
                 "take_profit_price": round(tp_price, 6),

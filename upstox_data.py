@@ -12,6 +12,8 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 
+from market_data_store import MarketDataStore
+
 INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 HISTORICAL_V3_URL = "https://api.upstox.com/v3/historical-candle"
 
@@ -55,6 +57,50 @@ class UpstoxDataClient:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def validate_token(self) -> tuple[bool, str]:
+        """Validate the access token by making a test API call.
+        
+        Returns:
+            Tuple of (is_valid, message)
+        """
+        # Basic format check - Upstox tokens are typically JWTs (start with 'ey') or long random strings
+        # They should not be URLs or obvious non-token strings
+        token = self.config.access_token.strip()
+        if len(token) < 20:
+            return False, "Token too short - doesn't appear to be a valid Upstox token"
+        if token.startswith(("http://", "https://", "www.")):
+            return False, "Invalid format - you entered a URL, not an access token"
+        if " " in token:
+            return False, "Token contains spaces - check you copied it correctly"
+        
+        try:
+            # Try to fetch a small amount of data for a well-known stock (RELIANCE)
+            # Using a short 1-day range to minimize data transfer
+            test_key = "NSE_EQ|INE002A01018"  # RELIANCE
+            url = f"{self.config.historical_url}/{test_key}/minutes/5/{date.today().isoformat()}/{(date.today() - timedelta(days=1)).isoformat()}"
+            resp = self.session.request("GET", url, timeout=self.config.request_timeout_sec)
+            
+            if resp.status_code == 401:
+                return False, "Invalid or expired token (401 Unauthorized)"
+            elif resp.status_code == 200:
+                # Also verify the response has valid data structure
+                try:
+                    data = resp.json()
+                    if data.get("status") == "success" or "data" in data:
+                        return True, "Token is valid"
+                    else:
+                        return False, f"API returned unexpected response: {data.get('message', 'Unknown error')}"
+                except Exception:
+                    return False, "Token appears invalid (malformed response)"
+            elif resp.status_code == 403:
+                return False, "Invalid or expired token (403 Forbidden)"
+            else:
+                return False, f"API returned HTTP {resp.status_code}: {resp.text[:100]}"
+        except requests.exceptions.RequestException as e:
+            return False, f"Connection error: {e}"
+        except Exception as e:
+            return False, f"Validation error: {e}"
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         last_exc: Exception | None = None
@@ -200,4 +246,42 @@ class UpstoxDataClient:
         }
         df = df.rename(columns=col_map)
         df = df[[c for c in ["timestamp", "open", "high", "low", "close", "volume", "oi"] if c in df.columns]]
+        return df
+
+    def fetch_5min_candles_cached(
+        self,
+        instrument_key: str,
+        symbol: str,
+        from_date: date,
+        to_date: date,
+        store: MarketDataStore | None = None,
+    ) -> pd.DataFrame:
+        """Fetch 5min candles with SQLite caching.
+        
+        Args:
+            instrument_key: The Upstox instrument key
+            symbol: The stock symbol (for reference)
+            from_date: Start date for candles
+            to_date: End date for candles
+            store: MarketDataStore instance for caching (created if None)
+            
+        Returns:
+            DataFrame with candle data
+        """
+        # Create default store if not provided
+        if store is None:
+            store = MarketDataStore(self.cache_dir / "market_data.sqlite")
+        
+        # Check if we already have full coverage in cache
+        if store.has_coverage(instrument_key, from_date, to_date):
+            # Return cached data
+            return store.get_candles_5m(instrument_key, from_date, to_date)
+        
+        # Fetch from API
+        df = self.fetch_5min_candles(instrument_key, from_date, to_date)
+        
+        # Store in cache if we got data
+        if not df.empty:
+            store.upsert_candles_5m(instrument_key, df)
+        
         return df
