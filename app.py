@@ -256,7 +256,6 @@ def _ensure_state() -> None:
         "unresolved_symbols": [],
         "non_trading_count": 0,
         "symbol_to_key": {},
-        "access_token": "",
         "parsed_triggers": pd.DataFrame(),
         "validated_symbols_count": 0,
         "sync_last_message": "",
@@ -273,7 +272,6 @@ def _ensure_state() -> None:
 
 def _resolve_symbols_for_csv(
     trigger_csv_bytes: bytes,
-    access_token: str,
 ) -> tuple[pd.DataFrame, dict[str, str], list[str], int]:
     trigger_df_raw = _read_csv_uploaded(trigger_csv_bytes)
     parsed_triggers = parse_chartink_csv(trigger_df_raw)
@@ -285,17 +283,17 @@ def _resolve_symbols_for_csv(
     non_trading_count = int((~parsed_triggers["trigger_date"].apply(lambda d: is_trading_day(d, holidays))).sum())
 
     unique_symbols = sorted(parsed_triggers["symbol"].unique().tolist())
-    with UpstoxDataClient(UpstoxConfig(access_token=access_token)) as client:
+    # No auth token needed for Upstox historical data
+    with UpstoxDataClient(UpstoxConfig(access_token="dummy")) as client:
         symbol_to_key, unresolved_symbols = client.resolve_symbols(unique_symbols)
     return parsed_triggers, symbol_to_key, unresolved_symbols, non_trading_count
 
 
 def _sync_data_for_csv(
     trigger_csv_bytes: bytes,
-    access_token: str,
 ) -> None:
     parsed_triggers, symbol_to_key, unresolved_symbols, non_trading_count = _resolve_symbols_for_csv(
-        trigger_csv_bytes, access_token
+        trigger_csv_bytes
     )
     st.session_state["sync_last_message"] = (
         f"Validated {len(symbol_to_key)} symbols for backtesting. "
@@ -310,13 +308,12 @@ def _sync_data_for_csv(
 
 def _run_backtest_pipeline(
     trigger_csv_bytes: bytes,
-    access_token: str,
     params: BacktestParams,
 ) -> None:
     from market_data_store import MarketDataStore
 
     parsed_triggers, symbol_to_key, unresolved_symbols, non_trading_count = _resolve_symbols_for_csv(
-        trigger_csv_bytes, access_token
+        trigger_csv_bytes
     )
     holidays = load_holidays(DEFAULT_HOLIDAY_PATH)
     live_fetched_symbols: set[str] = set()
@@ -328,7 +325,8 @@ def _run_backtest_pipeline(
     cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
     store = MarketDataStore(cache_db_path)
 
-    with UpstoxDataClient(UpstoxConfig(access_token=access_token)) as client:
+    # No auth token needed for Upstox historical data
+    with UpstoxDataClient(UpstoxConfig(access_token="dummy")) as client:
         selected_triggers = choose_daily_triggers(parsed_triggers, params.max_stocks_per_day)
         if not selected_triggers.empty:
             calendar_buffer_days = max(10, (params.holding_days * 3) + 7)
@@ -397,7 +395,6 @@ def _run_backtest_pipeline(
     st.session_state["unresolved_symbols"] = unresolved_symbols
     st.session_state["non_trading_count"] = non_trading_count
     st.session_state["symbol_to_key"] = symbol_to_key
-    st.session_state["access_token"] = access_token
     st.session_state["parsed_triggers"] = parsed_triggers
     # Track data source stats
     st.session_state["live_fetched_symbols_count"] = len(live_fetched_symbols - cached_symbols)
@@ -417,24 +414,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Backtest Inputs")
-        access_token = st.text_input("Upstox Access Token", type="password")
         
-        if st.button("Test Token", type="secondary"):
-            token = access_token.strip()
-            if not token:
-                st.error("Please enter an access token first")
-            else:
-                with st.spinner("Validating token..."):
-                    try:
-                        with UpstoxDataClient(UpstoxConfig(access_token=token)) as client:
-                            is_valid, message = client.validate_token()
-                            if is_valid:
-                                st.success(f"✓ {message}")
-                            else:
-                                st.error(f"✗ {message}")
-                    except Exception as e:
-                        st.error(f"✗ Validation failed: {e}")
-
         stop_loss_pct = st.number_input("Stop Loss %", min_value=0.1, max_value=50.0, value=3.0, step=0.1)
         take_profit_pct = st.number_input("Take Profit %", min_value=0.1, max_value=100.0, value=5.0, step=0.1)
         
@@ -516,12 +496,8 @@ def main() -> None:
         if uploaded_trigger_csv is None:
             st.error("Upload trigger CSV to sync data.")
             return
-        effective_token = access_token.strip() or st.session_state.get("access_token", "")
-        if not effective_token:
-            st.error("Add Upstox access token in sidebar.")
-            return
         try:
-            _sync_data_for_csv(uploaded_trigger_csv.getvalue(), effective_token)
+            _sync_data_for_csv(uploaded_trigger_csv.getvalue())
             st.success(st.session_state.get("sync_last_message", "Sync completed."))
         except TriggerValidationError as exc:
             st.error(f"Validation failed: {exc}")
@@ -540,11 +516,6 @@ def main() -> None:
             st.error("Upload trigger CSV to run backtest.")
             return
 
-        effective_token = access_token.strip() or st.session_state.get("access_token", "")
-        if not effective_token:
-            st.error("Add Upstox access token in sidebar.")
-            return
-
         params = BacktestParams(
             stop_loss_pct=float(stop_loss_pct),
             take_profit_pct=float(take_profit_pct),
@@ -559,7 +530,7 @@ def main() -> None:
 
         try:
             with st.spinner("Running backtest..."):
-                _run_backtest_pipeline(uploaded_trigger_csv.getvalue(), effective_token, params)
+                _run_backtest_pipeline(uploaded_trigger_csv.getvalue(), params)
         except TriggerValidationError as exc:
             st.error(f"Validation failed: {exc}")
             st.exception(exc)
@@ -752,9 +723,8 @@ def main() -> None:
                 cache_db_path = APP_DIR / ".cache" / "market_data.sqlite"
                 from market_data_store import MarketDataStore
                 chart_store = MarketDataStore(cache_db_path)
-                with UpstoxDataClient(
-                    UpstoxConfig(access_token=st.session_state.get("access_token", "") or access_token.strip())
-                ) as client:
+                # No auth token needed for Upstox historical data
+                with UpstoxDataClient(UpstoxConfig(access_token="dummy")) as client:
                     candles = client.fetch_5min_candles_cached(
                         key, str(selected_trade["symbol"]), chart_from, chart_to, chart_store
                     )
