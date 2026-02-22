@@ -23,6 +23,7 @@ class BacktestParams:
     brokerage_per_side: float = 20.0
     tie_break_rule: str = "conservative"  # conservative => SL first, optimistic => TP first
     trade_direction: str = "BUY"  # BUY or SELL
+    entry_day_offset: int = 0  # Days to delay entry after trigger date (0 = same day)
 
     @property
     def round_trip_brokerage(self) -> float:
@@ -118,6 +119,22 @@ def get_nth_trading_day(start_day: date, n: int, holidays: set[date]) -> date:
         d += timedelta(days=1)
 
 
+def shift_trading_days(start_day: date, days: int, holidays: set[date]) -> date:
+    """Shift a date forward by N trading days (skipping weekends and holidays).
+    
+    Args:
+        start_day: The starting date
+        days: Number of trading days to shift (0 = same day)
+        holidays: Set of holiday dates
+    
+    Returns:
+        The date that is N trading days after start_day
+    """
+    if days <= 0:
+        return start_day
+    return get_nth_trading_day(start_day, days + 1, holidays)
+
+
 def _entry_timestamp(trigger_day: date, entry_time: time) -> datetime:
     return datetime.combine(trigger_day, entry_time).replace(tzinfo=IST)
 
@@ -154,7 +171,10 @@ def run_backtest(
         trigger_day = row.trigger_date
         symbol = row.symbol
 
-        if not is_trading_day(trigger_day, holidays):
+        # Apply entry day offset - shift the trigger date forward by N trading days
+        effective_trigger_day = shift_trading_days(trigger_day, params.entry_day_offset, holidays)
+
+        if not is_trading_day(effective_trigger_day, holidays):
             skipped.append(
                 {
                     "trigger_date": trigger_day,
@@ -164,10 +184,10 @@ def run_backtest(
             )
             continue
 
-        entry_ts = _entry_timestamp(trigger_day, params.entry_time)
-        exit_day_limit = get_nth_trading_day(trigger_day, params.effective_holding_days, holidays)
+        entry_ts = _entry_timestamp(effective_trigger_day, params.entry_time)
+        exit_day_limit = get_nth_trading_day(effective_trigger_day, params.effective_holding_days, holidays)
 
-        candles = candle_fetcher(symbol, trigger_day, exit_day_limit)
+        candles = candle_fetcher(symbol, effective_trigger_day, exit_day_limit)
         if candles.empty:
             skipped.append({"trigger_date": trigger_day, "symbol": symbol, "reason": "NO_CANDLES"})
             continue
@@ -185,7 +205,7 @@ def run_backtest(
             continue
 
         candles = candles[
-            (candles["timestamp"].dt.date >= trigger_day)
+            (candles["timestamp"].dt.date >= effective_trigger_day)
             & (candles["timestamp"].dt.date <= exit_day_limit)
         ]
 

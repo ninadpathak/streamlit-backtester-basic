@@ -16,6 +16,7 @@ from backtester import (
     load_holidays,
     parse_chartink_csv,
     run_backtest,
+    shift_trading_days,
 )
 from upstox_data import UpstoxConfig, UpstoxDataClient, UpstoxDataError
 
@@ -513,6 +514,15 @@ def main() -> None:
                 value=time(9, 30),
                 step=300,
             )
+            
+            entry_day_offset = st.number_input(
+                "Entry Day Offset",
+                min_value=0,
+                max_value=10,
+                value=0,
+                step=1,
+                help="Days to delay entry after signal date (0 = same day, 1 = next trading day, etc.)",
+            )
 
         with st.expander("Capital & Fees", expanded=False):
             capital_per_trade = st.number_input(
@@ -608,6 +618,7 @@ def main() -> None:
             brokerage_per_side=float(brokerage_per_side),
             tie_break_rule=str(tie_break_rule),
             trade_direction=str(trade_direction),
+            entry_day_offset=int(entry_day_offset),
         )
 
         try:
